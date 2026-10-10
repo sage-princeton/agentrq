@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	entity "github.com/agentrq/agentrq/backend/internal/data/entity/crud"
@@ -18,6 +19,12 @@ import (
 )
 
 var ErrNotFound = errors.New("not found")
+
+// TaskToolCallWindow is how many of a task's tool calls are loaded with it:
+// the most recent ones. A long-running agent makes tens of thousands, and
+// loading every one on every read, write and published event made each of
+// those cost more the longer the task ran.
+const TaskToolCallWindow = 500
 
 type Repository interface {
 	// Workspace
@@ -224,12 +231,15 @@ func (r *repository) GetTask(ctx context.Context, workspaceID, taskID int64, use
 	var t model.Task
 	err := r.conn(ctx).
 		Preload("Messages").
-		Preload("ToolCalls").
 		Where("id = ? AND workspace_id = ? AND user_id = ?", taskID, workspaceID, userID).
 		First(&t).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return model.Task{}, ErrNotFound
 	}
+	if err != nil {
+		return t, err
+	}
+	t.ToolCalls, err = r.ListToolCalls(ctx, t.ID)
 	return t, err
 }
 
@@ -367,8 +377,12 @@ func (r *repository) GetNextTask(ctx context.Context, workspaceID int64, userID 
 	return t, err
 }
 
+// UpdateTask writes the task's own columns only. Messages and tool calls are
+// created through their own calls, and saving the loaded ones back with the
+// task put every row in one statement, which SQLite refuses once a task has
+// made more than 4,095 tool calls.
 func (r *repository) UpdateTask(ctx context.Context, t model.Task) (model.Task, error) {
-	if err := r.conn(ctx).Save(&t).Error; err != nil {
+	if err := r.conn(ctx).Omit(clause.Associations).Save(&t).Error; err != nil {
 		return model.Task{}, err
 	}
 	return t, nil
@@ -432,14 +446,19 @@ func (r *repository) CreateToolCall(ctx context.Context, tc model.ToolCall) (mod
 	return tc, nil
 }
 
-// ListToolCalls returns a task's tool calls in the order they were made.
+// ListToolCalls returns a task's most recent TaskToolCallWindow tool calls in
+// the order they were made.
 //
 // The task view carries them alongside the messages, so anything rebuilding a
-// task outside GetTask — which preloads both — has to load them itself, or it
+// task outside GetTask — which loads both — has to load them itself, or it
 // publishes a task that looks like it never called a tool.
+//
+// IDs are minted with CreatedAt from a time-ordered generator, so ordering by
+// ID is creation order, and the task_id index serves it without a sort.
 func (r *repository) ListToolCalls(ctx context.Context, taskID int64) ([]model.ToolCall, error) {
 	var tcs []model.ToolCall
-	err := r.conn(ctx).Where("task_id = ?", taskID).Order("created_at asc").Find(&tcs).Error
+	err := r.conn(ctx).Where("task_id = ?", taskID).Order("id desc").Limit(TaskToolCallWindow).Find(&tcs).Error
+	slices.Reverse(tcs)
 	return tcs, err
 }
 
